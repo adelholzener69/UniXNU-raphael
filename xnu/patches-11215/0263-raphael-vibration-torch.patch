@@ -2,26 +2,34 @@ raphael (Redmi K20 Pro, SM8150): the vibration motor and the flashlight, ported 
 
 - Source: HakiOS's raphael drivers (drivers/haptic/hakios.raphael_haptic.c, the raphael path of
   drivers/camera/hakios.torch.c), which work on this phone under HakiOS's xnu-8796 kernel. Rewritten onto
-  sweet_spmi.c instead of HakiOS's own PMIC arbiter code: same registers, values and order of writes.
+  sweet_spmi.c instead of HakiOS's own PMIC arbiter code: same registers, values and order of writes, plus the
+  haptics actuator type (below), which HakiOS does not set.
 - Vibration: PM8150B haptics (SID 3 0xc000, an ERM). Constant VMAX drive at 2552 mV (device tree vmax 3000 mV):
-  VMAX_CFG 0xc051, SEL 0xc04e (source VMAX), EN_CTL1 0xc046, PLAY 0xc070 (qti-haptics.c order); at most 1000 ms
+  CFG1 0xc04c bit 0 = ERM (the block resets to LRA; after `fastboot boot' Android's qti-haptics never set it, and
+  without it the motor did not buzz on the phone; with it, it does), VMAX_CFG 0xc051, SEL 0xc04e (source VMAX), EN_CTL1 0xc046,
+  PLAY 0xc070 (qti-haptics.c order); at most 1000 ms
   a buzz; a short circuit (STATUS1 0xc00a bit 3) stops it and latches it off for the boot.
 - Torch: PM8150L flash v2 (SID 5 0xd300), channel 0 only, at most 100 mA: IRESOLUTION 0xd347, STROBE_CTRL0 0xd349,
   ITARGET0 0xd343, SAFETY_TIMER0 0xd340 (0x13), MODULE_EN 0xd346, EN_LED_CTRL 0xd34c (leds-qpnp-flash-v2.c order).
   Off after sweettorch_max_s (default 30, max 120); the module's fault flag (0xd310), supply droop (0xd309 bit 4)
   or the PM8150L temperature alarm (SID 5 0x2408) switch it off and latch it.
 - Every write but PLAY is read back; a failed or mismatched write latches that part off (the off writes still go).
-- sweet_spmi.c: raphael reads gain SID 3 0xc0 and SID 5 0xd3 / 0x24; raphael writes gain exactly those ten
+- sweet_spmi.c: raphael reads gain SID 3 0xc0 and SID 5 0xd3 / 0x24; raphael writes gain exactly those eleven
   single-byte registers, and only after sweet_spmi_vibtorch_writes() (sweetvib= / sweettorch= >= 2).
 - Boot-args (all off by default): sweetvib=1 / sweettorch=1 log the blocks (reads only); =2 one test at boot
   (sweetvib_ms, default 150; sweettorch_s, default 2); =3 serve kern.sweet_vibrate (ms) and kern.sweet_torch
-  (0..1000 permille of 100 mA). sweet_reboot_restart() switches both off first (not on a panic).
+  (0..1000 permille of 100 mA). sweet_reboot_restart() switches both off first; on a panic,
+  sweet_reboot_note_panic() calls sweet_vibtorch_panic(), which switches both off with SPMI in atomic mode (the
+  write channels are already mapped). Without it, a panic during the boot buzz left the motor running.
 - Not here: iOS's own haptics and Control Center's flashlight do not reach these sysctls (HakiOS uses userland
   hooks for that).
 
 Checked: syntax-only compile of the changed files against this series' tree (clang, -Wall -Wextra, no warnings);
 the driver run in a user-space simulation against a fake PMIC enforcing this patch's whitelist (boot tests,
-sysctls, time limit, short circuit, temperature alarm, read-back mismatch, whitelist). Not yet run on the phone.
+sysctls, time limit, short circuit, temperature alarm, read-back mismatch, whitelist). On the phone (fastboot
+boot, no iOS root, so the boot ends in an initproc panic): the torch test lit the flashlight. Without the CFG1
+ERM write the motor did not buzz; with it, it buzzed, but the initproc panic came within the 500 ms test and
+left it running (hence the panic stop). The panic stop has run only in the simulation so far.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 index ea5a65a..2b3559b 100644
@@ -36,18 +44,27 @@ index ea5a65a..2b3559b 100644
  bsd/dev/beryllium_bt_hci.c		standard
  bsd/dev/mem.c				standard
 diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
-index 8228f52..43ca5c7 100644
+index 8228f52..82270b4 100644
 --- a/bsd/dev/sweet_reboot.c
 +++ b/bsd/dev/sweet_reboot.c
-@@ -49,6 +49,7 @@
+@@ -49,6 +49,8 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  extern void delay(int usec);
 +extern void sweet_vibtorch_quiesce(void);  /* bsd/dev/sweet_vibtorch.c (0263) */
++extern void sweet_vibtorch_panic(void);    /* bsd/dev/sweet_vibtorch.c (0263) */
  extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE CACHE (patch 0221) */
  
  #define SR_PSHOLD_PA     0x0c264000u
-@@ -212,6 +213,10 @@ sweet_reboot_restart(int panic_restart)
+@@ -201,6 +203,7 @@ void
+ sweet_reboot_note_panic(void)
+ {
+ 	sr_in_panic = true;
++	sweet_vibtorch_panic();		/* raphael (0263): motor and torch off, without sleeping */
+ }
+ 
+ /*
+@@ -212,6 +215,10 @@ sweet_reboot_restart(int panic_restart)
  {
  	int mode;
  
@@ -59,7 +76,7 @@ index 8228f52..43ca5c7 100644
  	 * Before anything else, make sure the UFS write cache holds nothing the file system already
  	 * completed: the reset below can power-cycle the device. Does not wait for dirty file pages
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 2f0b945..1ec633c 100644
+index 2f0b945..cac801d 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -167,7 +167,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
@@ -88,7 +105,7 @@ index 2f0b945..1ec633c 100644
  
  void
  sweet_spmi_charger_writes(void)
-@@ -237,8 +247,27 @@ static bool
+@@ -237,8 +247,28 @@ static bool
  sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
  {
  	if (sweet_board_raphael()) {
@@ -100,7 +117,8 @@ index 2f0b945..1ec633c 100644
 +		}
 +		/*
 +		 * 0263 (sweet_vibtorch.c), single bytes, only once unlocked (sweetvib= / sweettorch= >= 2):
-+		 * PM8150B haptics (SID 3): EN_CTL1 0xc046, SEL 0xc04e, VMAX_CFG 0xc051, PLAY 0xc070.
++		 * PM8150B haptics (SID 3): EN_CTL1 0xc046, CFG1 0xc04c (actuator type), SEL 0xc04e, VMAX_CFG 0xc051,
++		 * PLAY 0xc070.
 +		 * PM8150L flash v2 (SID 5): SAFETY_TIMER0 0xd340, ITARGET0 0xd343, MODULE_EN 0xd346, IRESOLUTION 0xd347,
 +		 * STROBE_CTRL0 0xd349, EN_LED_CTRL 0xd34c. Nothing else of either block, nor of the PMICs' supplies.
 +		 */
@@ -108,7 +126,7 @@ index 2f0b945..1ec633c 100644
 +			return false;
 +		}
 +		if (sid == 3 && sp_haptics_writes) {
-+			return addr == 0xc046u || addr == 0xc04eu || addr == 0xc051u || addr == 0xc070u;
++			return addr == 0xc046u || addr == 0xc04cu || addr == 0xc04eu || addr == 0xc051u || addr == 0xc070u;
 +		}
 +		if (sid == 5 && sp_flash_writes) {
 +			return addr == 0xd340u || addr == 0xd343u || addr == 0xd346u || addr == 0xd347u ||
@@ -161,10 +179,10 @@ index 27caa07..f48aa5c 100644
  	sweet_touch_init();
 diff --git a/bsd/dev/sweet_vibtorch.c b/bsd/dev/sweet_vibtorch.c
 new file mode 100644
-index 0000000..11d3c75
+index 0000000..b631951
 --- /dev/null
 +++ b/bsd/dev/sweet_vibtorch.c
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,616 @@
 +/*
 + * raphael (Redmi K20 Pro / Mi 9T Pro, SM8150): the vibration motor and the flashlight (patch 0263).
 + *
@@ -172,8 +190,9 @@ index 0000000..11d3c75
 + * this kernel's shared, whitelisted PMIC access (sweet_spmi.c) instead of HakiOS's own arbiter code:
 + *
 + *   vibration  PM8150B haptics block, SID 3 0xc000 (pm8150b_haptics, "qcom,haptics", an ERM). A constant drive of
-+ *              VMAX (2552 mV, below the device tree's qcom,vmax-mv 3000), in the order of qti-haptics.c: VMAX_CFG,
-+ *              SEL (source = VMAX), EN_CTL1 on, PLAY; off: PLAY 0, EN_CTL1 0.
++ *              VMAX (2552 mV, below the device tree's qcom,vmax-mv 3000), in the order of qti-haptics.c: CFG1
++ *              actuator type ERM (the block comes out of reset as LRA, and after `fastboot boot' Android's driver
++ *              never set it), VMAX_CFG, SEL (source = VMAX), EN_CTL1 on, PLAY; off: PLAY 0, EN_CTL1 0.
 + *   torch      PM8150L flash LED module ("flash v2"), SID 5 0xd300, channel 0 (led:torch_0) only, at most 100 mA,
 + *              in the order of leds-qpnp-flash-v2.c qpnp_flash_led_switch_set(): IRESOLUTION, software strobe,
 + *              ITARGET, safety timer off (0x13), MODULE_EN, EN_LED_CTRL. Guarded by the module's fault flag, its
@@ -191,7 +210,8 @@ index 0000000..11d3c75
 + *
 + * Every write is read back (except PLAY); a write that fails or does not read back, a short circuit, a fault or a
 + * temperature alarm stops the part and latches it off for the rest of the boot. sweet_vibtorch_quiesce() switches
-+ * both off before a reboot.
++ * both off before a reboot, sweet_vibtorch_panic() on a panic (which stops the other CPUs, the worker with them: on
++ * the phone a panic during the boot buzz left the motor running until a forced restart).
 + *
 + * Not done here: iOS's own haptics (CoreHaptics / AVHapticPlayer) and Control Center's flashlight (AVFlashlight in
 + * mediaserverd) do not reach these sysctls; HakiOS does that with userland hooks this tree does not carry.
@@ -212,6 +232,7 @@ index 0000000..11d3c75
 +
 +void sweet_vibtorch_init(void);
 +void sweet_vibtorch_quiesce(void);
++void sweet_vibtorch_panic(void);
 +
 +static uint64_t
 +vt_now_ms(void)
@@ -298,6 +319,8 @@ index 0000000..11d3c75
 +
 +#define HAP_STATUS1     0x0a    /* [3] short circuit */
 +#define HAP_EN_CTL1     0x46    /* [7] on */
++#define HAP_CFG1        0x4c    /* [0] actuator type: 0 LRA (reset), 1 ERM */
++#define HAP_CFG1_ERM    0x01
 +#define HAP_SEL         0x4e    /* [5:4] waveform source, 0 = VMAX */
 +#define HAP_VMAX_CFG    0x51    /* [5:1] 116 mV steps */
 +#define HAP_PLAY        0x70    /* [7] play */
@@ -324,7 +347,8 @@ index 0000000..11d3c75
 +		vt_give_up(&vt_hap, "short circuit (or unreadable status)");
 +		return false;
 +	}
-+	if (!vt_put_bits(&vt_hap, HAP_VMAX_CFG, 0x3e, HAP_VMAX_CODE) || !vt_put_bits(&vt_hap, HAP_SEL, 0x31, 0x00)) {
++	if (!vt_put_bits(&vt_hap, HAP_CFG1, 0x01, HAP_CFG1_ERM) ||
++	    !vt_put_bits(&vt_hap, HAP_VMAX_CFG, 0x3e, HAP_VMAX_CODE) || !vt_put_bits(&vt_hap, HAP_SEL, 0x31, 0x00)) {
 +		return false;
 +	}
 +	hap_on = true;
@@ -743,6 +767,35 @@ index 0000000..11d3c75
 +	if (fl_lit) {
 +		vt_fl.broken = false;
 +		printf("SWEET TORCH: before reboot: %s\n", fl_dark() ? "off" : "COULD NOT BE SWITCHED OFF");
++	}
++}
++
++/*
++ * On a panic's way out (SweetPlatformExpert::haltRestart, kPEPanicBegin and after, via sweet_reboot_note_panic):
++ * both off. The other CPUs are stopped, so the worker may be anywhere, even inside an SPMI access; from here on the
++ * SPMI lock is only tried (sweet_spmi_atomic) and nothing sleeps or maps: the write channels were mapped when the
++ * parts were switched on. Once only.
++ */
++void
++sweet_vibtorch_panic(void)
++{
++	static bool done;
++
++	if (done || !sweet_board_raphael()) {
++		return;
++	}
++	done = true;
++	if (!(hap_playing || hap_on || fl_lit)) {
++		return;
++	}
++	sweet_spmi_atomic();
++	if (hap_playing || hap_on) {
++		vt_hap.broken = false;
++		(void)hap_stop();
++	}
++	if (fl_lit) {
++		vt_fl.broken = false;
++		(void)fl_dark();
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */

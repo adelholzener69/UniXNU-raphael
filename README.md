@@ -25,7 +25,7 @@ partition to the home screen with GPU compositing.**
 | Touch, buttons | GT9886 (Normandy) touch, PON / volume keys (patch 0260) |
 | GPU | Adreno 640 kernel driver (0261: GMU, HFI v2, GX, zap, CP, governor 257-585 MHz). Chlorophyll (Bergamota's Metal driver over Mesa freedreno, upstream's prebuilt dylibs) as the system compositor and for the iOS 18 wallpaper: home-screen swipes 32 fps (CPU compositing: 10 fps) |
 | Clock, battery | Wall clock from the PM8150 RTC (set once, kept across reboots); live charge level from the PM8150B fuel gauge (0262) |
-| Vibration, torch | PM8150B vibration motor and PM8150L flash LED, ported from [HakiOS](https://github.com/adelholzener69/hakios-xnu-kernel-raphael) (0263): off by default, `sweetvib=3 sweettorch=3` serve `kern.sweet_vibrate` / `kern.sweet_torch`. Not yet run on the phone; iOS's own haptics and Control Center flashlight are not hooked up |
+| Vibration, torch | PM8150B vibration motor and PM8150L flash LED, ported from [HakiOS](https://github.com/adelholzener69/hakios-xnu-kernel-raphael) (0263): off by default, `sweetvib=3 sweettorch=3` serve `kern.sweet_vibrate` / `kern.sweet_torch`. Boot tests buzz and light on the phone (no iOS root yet, so the sysctls are untested); iOS's own haptics and Control Center flashlight are not hooked up |
 | Debug | USB CDC-ECM link to WSL: SSH and the kernel log over UDP (`tools/raphael/usblink.sh`) |
 | Not working | Wi-Fi, Bluetooth, cellular, audio, camera, sensors; Settings > Date & Time hangs |
 

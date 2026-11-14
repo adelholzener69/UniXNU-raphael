@@ -148,7 +148,9 @@ Checked on the phone 2026-11-06 (kernel run 42190048551, image T12):
 
 Ported from HakiOS's raphael drivers (`drivers/haptic/hakios.raphael_haptic.c`, the raphael path of
 `drivers/camera/hakios.torch.c`, [adelholzener69/hakios-xnu-kernel-raphael](https://github.com/adelholzener69/hakios-xnu-kernel-raphael)),
-where they work on this phone, onto `sweet_spmi.c`: `bsd/dev/sweet_vibtorch.c`. Off unless a boot-arg asks:
+onto `sweet_spmi.c`: `bsd/dev/sweet_vibtorch.c`. Unlike HakiOS it first sets the haptics block's actuator type to
+ERM (CFG1 0xc04c bit 0): the block resets to LRA, and after `fastboot boot` Android never set it, so without that
+write the motor did not buzz. Off unless a boot-arg asks:
 
 | Boot-arg | Does |
 | --- | --- |
@@ -162,11 +164,16 @@ Over SSH, as root, with `=3`:
 - `sysctl -w kern.sweet_torch=500`: torch at 500/1000 of 100 mA (12.5 mA steps); `0` off. Goes off by itself after
   `sweettorch_max_s`, and stays off until written again.
 
-Only ten single-byte registers become writable, and only with `=2` or `=3`. Every write is read back. A short
+Only eleven single-byte registers become writable, and only with `=2` or `=3`. Every write is read back. A short
 circuit, a flash fault, supply droop, the PM8150L temperature alarm or a write that does not read back switches
 the part off for the rest of the boot (`SWEET VIB:` / `SWEET TORCH:` in the log says why). Both are switched off
-before a reboot.
+before a reboot and on a panic (`sweet_reboot_note_panic`).
 
-Status: compiled (syntax-only) and simulated against a fake PMIC; **not yet run on the phone**. Start with `=1`
-and check that the log shows type 0x18 subtype 0x04 for the flash module (HakiOS saw that on the phone) before
-trying `=2`. iOS's own haptics (CoreHaptics) and Control Center's flashlight do not reach these sysctls yet.
+The driver, like USB, keys and touch, is started by `sweet_ufs.c` once it has found the root partition
+(`rd=ufsroot0`); with any other `rd=` none of them run.
+
+Status (2026-11-14, local build, `fastboot boot` without an iOS root, so every boot ended in the `initproc exited`
+panic): `sweettorch=2` lit the flashlight; `sweetvib=2` buzzed (with the ERM write); a panic during the buzz and
+during the torch switched each off at once. Not yet run: the end of a boot test without a panic, and `=3` (the
+sysctls need an iOS root and a shell). iOS's own haptics (CoreHaptics) and Control Center's flashlight do not reach
+these sysctls yet.
