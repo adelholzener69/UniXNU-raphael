@@ -1,0 +1,748 @@
+raphael (Redmi K20 Pro, SM8150): the vibration motor and the flashlight, ported from HakiOS.
+
+- Source: HakiOS's raphael drivers (drivers/haptic/hakios.raphael_haptic.c, the raphael path of
+  drivers/camera/hakios.torch.c), which work on this phone under HakiOS's xnu-8796 kernel. Rewritten onto
+  sweet_spmi.c instead of HakiOS's own PMIC arbiter code: same registers, values and order of writes.
+- Vibration: PM8150B haptics (SID 3 0xc000, an ERM). Constant VMAX drive at 2552 mV (device tree vmax 3000 mV):
+  VMAX_CFG 0xc051, SEL 0xc04e (source VMAX), EN_CTL1 0xc046, PLAY 0xc070 (qti-haptics.c order); at most 1000 ms
+  a buzz; a short circuit (STATUS1 0xc00a bit 3) stops it and latches it off for the boot.
+- Torch: PM8150L flash v2 (SID 5 0xd300), channel 0 only, at most 100 mA: IRESOLUTION 0xd347, STROBE_CTRL0 0xd349,
+  ITARGET0 0xd343, SAFETY_TIMER0 0xd340 (0x13), MODULE_EN 0xd346, EN_LED_CTRL 0xd34c (leds-qpnp-flash-v2.c order).
+  Off after sweettorch_max_s (default 30, max 120); the module's fault flag (0xd310), supply droop (0xd309 bit 4)
+  or the PM8150L temperature alarm (SID 5 0x2408) switch it off and latch it.
+- Every write but PLAY is read back; a failed or mismatched write latches that part off (the off writes still go).
+- sweet_spmi.c: raphael reads gain SID 3 0xc0 and SID 5 0xd3 / 0x24; raphael writes gain exactly those ten
+  single-byte registers, and only after sweet_spmi_vibtorch_writes() (sweetvib= / sweettorch= >= 2).
+- Boot-args (all off by default): sweetvib=1 / sweettorch=1 log the blocks (reads only); =2 one test at boot
+  (sweetvib_ms, default 150; sweettorch_s, default 2); =3 serve kern.sweet_vibrate (ms) and kern.sweet_torch
+  (0..1000 permille of 100 mA). sweet_reboot_restart() switches both off first (not on a panic).
+- Not here: iOS's own haptics and Control Center's flashlight do not reach these sysctls (HakiOS uses userland
+  hooks for that).
+
+Checked: syntax-only compile of the changed files against this series' tree (clang, -Wall -Wextra, no warnings);
+the driver run in a user-space simulation against a fake PMIC enforcing this patch's whitelist (boot tests,
+sysctls, time limit, short circuit, temperature alarm, read-back mismatch, whitelist). Not yet run on the phone.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea5a65a..2b3559b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
++bsd/dev/sweet_vibtorch.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 8228f52..43ca5c7 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -49,6 +49,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void delay(int usec);
++extern void sweet_vibtorch_quiesce(void);  /* bsd/dev/sweet_vibtorch.c (0263) */
+ extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE CACHE (patch 0221) */
+ 
+ #define SR_PSHOLD_PA     0x0c264000u
+@@ -212,6 +213,10 @@ sweet_reboot_restart(int panic_restart)
+ {
+ 	int mode;
+ 
++	if (!panic_restart && !sr_in_panic) {
++		sweet_vibtorch_quiesce();	/* raphael (0263): motor and torch off */
++	}
++
+ 	/*
+ 	 * Before anything else, make sure the UFS write cache holds nothing the file system already
+ 	 * completed: the reset below can power-cycle the device. Does not wait for dirty file pages
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 2f0b945..1ec633c 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -167,7 +167,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		 */
+ 		allowed = (sid == 0 && (peripheral == 0x60 || peripheral == 0x61)) ||
+ 		    (sid == 2 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 || peripheral == 0x13 ||
+-		    peripheral == 0x15 || peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41));
++		    peripheral == 0x15 || peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41)) ||
++		    (sid == 3 && peripheral == 0xc0) ||                                     /* 0263: PM8150B haptics */
++		    (sid == 5 && (peripheral == 0xd3 || peripheral == 0x24));               /* 0263: PM8150L flash LED, temp alarm */
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+@@ -226,6 +228,14 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  * termination, OTG) is writable.
+  */
+ static bool sp_charger_writes;
++static bool sp_haptics_writes, sp_flash_writes;
++
++void
++sweet_spmi_vibtorch_writes(bool haptics, bool flash)
++{
++	sp_haptics_writes = haptics && sweet_board_raphael();
++	sp_flash_writes = flash && sweet_board_raphael();
++}
+ 
+ void
+ sweet_spmi_charger_writes(void)
+@@ -237,8 +247,27 @@ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
+ 	if (sweet_board_raphael()) {
+-		/* 0262: only the PM8150 RTC alarm data 0x6140-0x6143 (the wall-clock offset, sweet_rtc_set) */
+-		return sid == 0 && len >= 1 && len <= 2 && addr >= 0x6140u && addr + len <= 0x6144u;
++		/* 0262: the PM8150 RTC alarm data 0x6140-0x6143 (the wall-clock offset, sweet_rtc_set) */
++		if (sid == 0) {
++			return len >= 1 && len <= 2 && addr >= 0x6140u && addr + len <= 0x6144u;
++		}
++		/*
++		 * 0263 (sweet_vibtorch.c), single bytes, only once unlocked (sweetvib= / sweettorch= >= 2):
++		 * PM8150B haptics (SID 3): EN_CTL1 0xc046, SEL 0xc04e, VMAX_CFG 0xc051, PLAY 0xc070.
++		 * PM8150L flash v2 (SID 5): SAFETY_TIMER0 0xd340, ITARGET0 0xd343, MODULE_EN 0xd346, IRESOLUTION 0xd347,
++		 * STROBE_CTRL0 0xd349, EN_LED_CTRL 0xd34c. Nothing else of either block, nor of the PMICs' supplies.
++		 */
++		if (len != 1) {
++			return false;
++		}
++		if (sid == 3 && sp_haptics_writes) {
++			return addr == 0xc046u || addr == 0xc04eu || addr == 0xc051u || addr == 0xc070u;
++		}
++		if (sid == 5 && sp_flash_writes) {
++			return addr == 0xd340u || addr == 0xd343u || addr == 0xd346u || addr == 0xd347u ||
++			       addr == 0xd349u || addr == 0xd34cu;
++		}
++		return false;
+ 	}
+ 	if (!sweet_board_beryllium() || len < 1 || len > 2) {
+ 		return false;
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 977edbe..b77d2b3 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -1,6 +1,7 @@
+ /* Shared C/C++ interface. Init once, on the SweetBattery start thread. */
+ #ifndef SWEET_BATTERY_SPMI_H
+ #define SWEET_BATTERY_SPMI_H
++#include <stdbool.h>
+ #include <stdint.h>
+ #ifdef __cplusplus
+ extern "C" {
+@@ -15,6 +16,8 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
+ /* Poco F1: unlock the seven PMI8998 charger registers of sweet_spmi_write (sweetcharger=2 only). */
+ void sweet_spmi_charger_writes(void);
++/* raphael (0263, sweet_vibtorch.c): unlock the PM8150B haptics / PM8150L flash LED registers of sweet_spmi_write. */
++void sweet_spmi_vibtorch_writes(bool haptics, bool flash);
+ /* Thread context: prepare a whitelisted write for later atomic use (0 ok). */
+ int sweet_spmi_prepare_write(unsigned sid, unsigned addr);
+ /* Reset time: no more sleeping locks or mappings in this module. */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 27caa07..f48aa5c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -74,6 +74,7 @@ extern void beryllium_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_charger_start(void);
++extern void sweet_vibtorch_init(void);
+ extern void sweet_a630_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -1150,6 +1151,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_cpufreq_max();
+ 	sweet_charger_start();
++	sweet_vibtorch_init();	/* raphael: sweetvib=N / sweettorch=N, off by default */
+ 	sweet_keys_init();
+ 	sweet_reboot_init();	/* beryllium: PS_HOLD reset + reboot reason, SWEET REBOOT: */
+ 	sweet_touch_init();
+diff --git a/bsd/dev/sweet_vibtorch.c b/bsd/dev/sweet_vibtorch.c
+new file mode 100644
+index 0000000..11d3c75
+--- /dev/null
++++ b/bsd/dev/sweet_vibtorch.c
+@@ -0,0 +1,581 @@
++/*
++ * raphael (Redmi K20 Pro / Mi 9T Pro, SM8150): the vibration motor and the flashlight (patch 0263).
++ *
++ * Ported from HakiOS (drivers/haptic/hakios.raphael_haptic.c, drivers/camera/hakios.torch.c, raphael paths), onto
++ * this kernel's shared, whitelisted PMIC access (sweet_spmi.c) instead of HakiOS's own arbiter code:
++ *
++ *   vibration  PM8150B haptics block, SID 3 0xc000 (pm8150b_haptics, "qcom,haptics", an ERM). A constant drive of
++ *              VMAX (2552 mV, below the device tree's qcom,vmax-mv 3000), in the order of qti-haptics.c: VMAX_CFG,
++ *              SEL (source = VMAX), EN_CTL1 on, PLAY; off: PLAY 0, EN_CTL1 0.
++ *   torch      PM8150L flash LED module ("flash v2"), SID 5 0xd300, channel 0 (led:torch_0) only, at most 100 mA,
++ *              in the order of leds-qpnp-flash-v2.c qpnp_flash_led_switch_set(): IRESOLUTION, software strobe,
++ *              ITARGET, safety timer off (0x13), MODULE_EN, EN_LED_CTRL. Guarded by the module's fault flag, its
++ *              supply-droop flag and the PM8150L temperature alarm (SID 5 0x2400).
++ *
++ * Off unless asked for (boot-args, one per part):
++ *   sweetvib=1 / sweettorch=1   a look, reading only: the block's type and subtype in the log
++ *   sweetvib=2 / sweettorch=2   ... and one test at boot: a buzz of sweetvib_ms (default 150, 20..1000) / the light at
++ *                               full torch current for sweettorch_s seconds (default 2, 1..10), then off
++ *   sweetvib=3 / sweettorch=3   ... and the part served until shutdown, no test at boot:
++ *                                 sysctl -w kern.sweet_vibrate=MS      buzz for MS ms (1..1000; 0 stops)
++ *                                 sysctl -w kern.sweet_torch=LEVEL     0 off, 1..1000 permille of 100 mA
++ *                               a read gives what runs now. The torch goes off after sweettorch_max_s (default 30,
++ *                               at most 120) and stays off until written anew.
++ *
++ * Every write is read back (except PLAY); a write that fails or does not read back, a short circuit, a fault or a
++ * temperature alarm stops the part and latches it off for the rest of the boot. sweet_vibtorch_quiesce() switches
++ * both off before a reboot.
++ *
++ * Not done here: iOS's own haptics (CoreHaptics / AVHapticPlayer) and Control Center's flashlight (AVFlashlight in
++ * mediaserverd) do not reach these sysctls; HakiOS does that with userland hooks this tree does not carry.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <IOKit/IOLocks.h>
++#include "sweet_board.h"
++#include "sweet_spmi.h"
++
++extern kern_return_t thread_terminate(thread_t);
++
++void sweet_vibtorch_init(void);
++void sweet_vibtorch_quiesce(void);
++
++static uint64_t
++vt_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* ---- one checked PMIC write -------------------------------------------------------------------------------------- */
++
++struct vt_part {
++	const char *name;
++	unsigned sid, base;
++	bool broken;    /* latched: no more writes this boot */
++	bool forcing;   /* the off writes pass the latch */
++};
++
++static struct vt_part vt_hap = { .name = "SWEET VIB", .sid = 3, .base = 0xc000 };
++static struct vt_part vt_fl = { .name = "SWEET TORCH", .sid = 5, .base = 0xd300 };
++
++static void
++vt_give_up(struct vt_part *p, const char *why)
++{
++	if (!p->broken) {
++		p->broken = true;
++		printf("%s: %s: no more writes this boot\n", p->name, why);
++	}
++}
++
++static bool
++vt_get(struct vt_part *p, unsigned reg, uint8_t *v)
++{
++	return sweet_spmi_read(p->sid, p->base + reg, v) == 0;
++}
++
++static bool
++vt_put(struct vt_part *p, unsigned reg, uint8_t value, bool readback)
++{
++	uint8_t back = 0xff;
++
++	if (p->broken && !p->forcing) {
++		return false;
++	}
++	if (sweet_spmi_write(p->sid, p->base + reg, &value, 1) != 0) {
++		printf("%s: %#x <- %#x refused or failed\n", p->name, p->base + reg, value);
++		vt_give_up(p, "a write that failed");
++		return false;
++	}
++	if (readback && (!vt_get(p, reg, &back) || back != value)) {
++		printf("%s: %#x <- %#x reads back %#x\n", p->name, p->base + reg, value, back);
++		vt_give_up(p, "a write that did not read back");
++		return false;
++	}
++	return true;
++}
++
++static bool
++vt_put_bits(struct vt_part *p, unsigned reg, uint8_t mask, uint8_t value)
++{
++	uint8_t now;
++
++	if (!vt_get(p, reg, &now)) {
++		vt_give_up(p, "a read that failed");
++		return false;
++	}
++	return (now & mask) == (value & mask) || vt_put(p, reg, (uint8_t)((now & ~mask) | (value & mask)), true);
++}
++
++static bool
++vt_probe(struct vt_part *p)
++{
++	uint8_t type = 0, subtype = 0;
++
++	if (!vt_get(p, 0x04, &type) || !vt_get(p, 0x05, &subtype)) {
++		printf("%s: SID %u %#x cannot be read\n", p->name, p->sid, p->base);
++		return false;
++	}
++	printf("%s: SID %u %#x type %#x subtype %#x\n", p->name, p->sid, p->base, type, subtype);
++	return true;
++}
++
++/* ---- vibration: PM8150B haptics --------------------------------------------------------------------------------- */
++
++#define HAP_STATUS1     0x0a    /* [3] short circuit */
++#define HAP_EN_CTL1     0x46    /* [7] on */
++#define HAP_SEL         0x4e    /* [5:4] waveform source, 0 = VMAX */
++#define HAP_VMAX_CFG    0x51    /* [5:1] 116 mV steps */
++#define HAP_PLAY        0x70    /* [7] play */
++#define HAP_VMAX_MV     2552
++#define HAP_VMAX_CODE   ((HAP_VMAX_MV / 116) << 1)
++#define HAP_MAX_MS      1000
++
++static bool hap_playing, hap_on;
++
++static bool
++hap_short(void)
++{
++	uint8_t s = 0;
++	return !vt_get(&vt_hap, HAP_STATUS1, &s) || (s & 0x08);
++}
++
++static bool
++hap_start(void)
++{
++	if (vt_hap.broken) {
++		return false;
++	}
++	if (hap_short()) {
++		vt_give_up(&vt_hap, "short circuit (or unreadable status)");
++		return false;
++	}
++	if (!vt_put_bits(&vt_hap, HAP_VMAX_CFG, 0x3e, HAP_VMAX_CODE) || !vt_put_bits(&vt_hap, HAP_SEL, 0x31, 0x00)) {
++		return false;
++	}
++	hap_on = true;
++	if (!vt_put(&vt_hap, HAP_EN_CTL1, 0x80, true)) {
++		return false;
++	}
++	hap_playing = true;
++	return vt_put(&vt_hap, HAP_PLAY, 0x80, false);
++}
++
++static bool
++hap_stop(void)
++{
++	bool ok;
++
++	if (!hap_playing && !hap_on) {
++		return true;
++	}
++	vt_hap.forcing = true;
++	ok = vt_put(&vt_hap, HAP_PLAY, 0x00, false);
++	delay(1000);
++	ok = vt_put(&vt_hap, HAP_EN_CTL1, 0x00, true) && ok;
++	vt_hap.forcing = false;
++	if (ok) {
++		hap_playing = hap_on = false;
++	}
++	return ok;
++}
++
++/* ---- torch: PM8150L flash v2, channel 0 ------------------------------------------------------------------------- */
++
++#define FL_STATUS2      0x09    /* [4] supply drooped */
++#define FL_RT_STS       0x10    /* [0] fault */
++#define FL_SAFETY0      0x40
++#define FL_SAFETY_OFF   0x13
++#define FL_ITARGET0     0x43    /* [6:0] (code + 1) * 12.5 mA */
++#define FL_MODULE_EN    0x46    /* [7] */
++#define FL_IRES         0x47    /* [1:0] channel 0: 0 = 12.5 mA steps */
++#define FL_STROBE0      0x49    /* [2] hardware strobe */
++#define FL_EN_LED       0x4c    /* [0] channel 0 */
++#define FL_IRES_UA      12500u
++#define FL_MAX_MA       100u
++#define FL_ITARGET_MAX  7u      /* round(100 mA / 12.5 mA) - 1 */
++#define ALARM_SID       5
++#define ALARM_BASE      0x2400
++
++static bool fl_lit;
++static uint8_t alarm_subtype;
++static bool alarm_found;
++
++/* What would put the light out now, or NULL. */
++static const char *
++fl_trouble(void)
++{
++	uint8_t rt = 0, st2 = 0, alarm = 0, stage = 0;
++
++	if (!vt_get(&vt_fl, FL_RT_STS, &rt) || !vt_get(&vt_fl, FL_STATUS2, &st2)) {
++		return "a status read that failed";
++	}
++	if (alarm_found) {
++		if (sweet_spmi_read(ALARM_SID, ALARM_BASE + 0x08, &alarm) != 0) {
++			return "a temperature alarm read that failed";
++		}
++		stage = alarm_subtype == 0x08 ? (alarm & 0x03) : ((alarm >> 4) & 0x07);
++	}
++	if (rt & 0x01) {
++		return "the module reports a fault";
++	}
++	if (st2 & 0x10) {
++		return "the supply drooped";
++	}
++	if (stage != 0) {
++		return "the PM8150L temperature alarm is raised";
++	}
++	return NULL;
++}
++
++static bool
++fl_light(uint32_t permille)
++{
++	uint32_t ua = FL_MAX_MA * permille, code;
++	const char *why;
++
++	if (vt_fl.broken) {
++		return false;
++	}
++	if (ua < FL_IRES_UA) {
++		ua = FL_IRES_UA;
++	}
++	code = (ua + FL_IRES_UA / 2) / FL_IRES_UA - 1;
++	if (code > FL_ITARGET_MAX) {
++		code = FL_ITARGET_MAX;
++	}
++	if (!fl_lit && (why = fl_trouble()) != NULL) {
++		printf("SWEET TORCH: not lit: %s\n", why);
++		vt_give_up(&vt_fl, why);
++		return false;
++	}
++	if (!vt_put_bits(&vt_fl, FL_IRES, 0x03, 0x00) || !vt_put_bits(&vt_fl, FL_STROBE0, 0x04, 0x00) ||
++	    !vt_put_bits(&vt_fl, FL_ITARGET0, 0x7f, (uint8_t)code) || !vt_put(&vt_fl, FL_SAFETY0, FL_SAFETY_OFF, true)) {
++		return false;
++	}
++	if (!fl_lit) {
++		fl_lit = true;  /* before the enabling writes: one that lands but fails its read-back still gets fl_dark() */
++		if (!vt_put(&vt_fl, FL_MODULE_EN, 0x80, true) || !vt_put_bits(&vt_fl, FL_EN_LED, 0x01, 0x01)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++fl_dark(void)
++{
++	bool ok;
++
++	if (!fl_lit) {
++		return true;
++	}
++	vt_fl.forcing = true;
++	ok = vt_put_bits(&vt_fl, FL_EN_LED, 0x01, 0x00);
++	ok = vt_put(&vt_fl, FL_MODULE_EN, 0x00, true) && ok;
++	ok = vt_put_bits(&vt_fl, FL_ITARGET0, 0x7f, 0x00) && ok;
++	ok = vt_put(&vt_fl, FL_SAFETY0, FL_SAFETY_OFF, true) && ok;
++	vt_fl.forcing = false;
++	fl_lit = !ok;
++	return ok;
++}
++
++/* ---- requests (sysctl) and the worker thread -------------------------------------------------------------------- */
++
++static IOLock *vt_lock;
++static bool vt_pending, vt_leaving;
++static int vib_level, torch_level;
++static uint32_t vib_req_ms;             /* new buzz request, 0 none */
++static bool vib_req_stop;
++static uint32_t torch_req = 0;          /* wanted permille */
++static uint32_t torch_max_s = 30;
++static volatile uint32_t vib_now_ms_left, torch_now;    /* for reads */
++
++static void
++vt_kick(void)
++{
++	IOLockLock(vt_lock);
++	vt_pending = true;
++	IOLockWakeup(vt_lock, &vt_pending, false);
++	IOLockUnlock(vt_lock);
++}
++
++static int
++vt_vibrate_sysctl SYSCTL_HANDLER_ARGS
++{
++	(void)arg1;
++	(void)arg2;
++	int value = (int)vib_now_ms_left;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (vib_level < 3 || vt_lock == NULL) {
++		return ENODEV;
++	}
++	if (value < 0 || value > HAP_MAX_MS) {
++		return EINVAL;
++	}
++	IOLockLock(vt_lock);
++	vib_req_ms = (uint32_t)value;
++	vib_req_stop = value == 0;
++	IOLockUnlock(vt_lock);
++	vt_kick();
++	return 0;
++}
++
++static int
++vt_torch_sysctl SYSCTL_HANDLER_ARGS
++{
++	(void)arg1;
++	(void)arg2;
++	int value = (int)torch_now;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || !req->newptr) {
++		return error;
++	}
++	if (torch_level < 3 || vt_lock == NULL) {
++		return ENODEV;
++	}
++	if (value < 0 || value > 1000) {
++		return EINVAL;
++	}
++	IOLockLock(vt_lock);
++	torch_req = (uint32_t)value;
++	IOLockUnlock(vt_lock);
++	vt_kick();
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    vt_vibrate_sysctl, "I", "raphael: buzz the vibration motor for N ms (sweetvib=3; 0 stops)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
++    vt_torch_sysctl, "I", "raphael: flashlight level in permille of 100 mA (sweettorch=3; 0 off)");
++
++static void
++vt_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	IOLockLock(vt_lock);
++	if (!vt_pending) {
++		if (ms == 0) {
++			IOLockSleep(vt_lock, &vt_pending, THREAD_UNINT);
++		} else {
++			clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++			IOLockSleepDeadline(vt_lock, &vt_pending, deadline, THREAD_UNINT);
++		}
++	}
++	vt_pending = false;
++	IOLockUnlock(vt_lock);
++}
++
++static void
++vt_boot_tests(void)
++{
++	if (vib_level == 2) {
++		uint32_t ms = 150;
++
++		(void)PE_parse_boot_argn("sweetvib_ms", &ms, sizeof(ms));
++		ms = ms < 20 ? 20 : ms > HAP_MAX_MS ? HAP_MAX_MS : ms;
++		printf("SWEET VIB: test buzz %u ms at %u mV\n", ms, HAP_VMAX_MV);
++		if (hap_start()) {
++			uint8_t s = 0;
++			delay_for_interval(ms, NSEC_PER_MSEC);
++			(void)vt_get(&vt_hap, HAP_STATUS1, &s);
++			printf("SWEET VIB: status while running %#x%s\n", s, (s & 0x08) ? " (SHORT CIRCUIT)" : "");
++		}
++		printf("SWEET VIB: %s\n", hap_stop() ? "stopped" : "COULD NOT BE STOPPED");
++	}
++	if (torch_level == 2) {
++		uint32_t secs = 2;
++
++		(void)PE_parse_boot_argn("sweettorch_s", &secs, sizeof(secs));
++		secs = secs < 1 ? 1 : secs > 10 ? 10 : secs;
++		printf("SWEET TORCH: test light %u s at %u mA\n", secs, FL_MAX_MA);
++		if (fl_light(1000)) {
++			for (uint32_t t = 0; t < secs * 10; ++t) {
++				const char *why;
++				delay_for_interval(100, NSEC_PER_MSEC);
++				if ((why = fl_trouble()) != NULL) {
++					printf("SWEET TORCH: %s while lit\n", why);
++					break;
++				}
++			}
++		}
++		printf("SWEET TORCH: %s\n", fl_dark() ? "off" : "COULD NOT BE SWITCHED OFF");
++	}
++}
++
++static void
++vt_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	uint64_t vib_until = 0, torch_since = 0, last_check = 0;
++	uint32_t torch_cur = 0;
++
++	if (sweet_spmi_init() != 0) {
++		printf("SWEET VIB/TORCH: no SPMI, nothing done\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	if (vib_level && !vt_probe(&vt_hap)) {
++		vib_level = 0;
++	}
++	if (torch_level) {
++		uint8_t type = 0;
++		if (!vt_probe(&vt_fl) || !vt_get(&vt_fl, 0x04, &type) || type != 0x18) {
++			printf("SWEET TORCH: not a flash LED module (type %#x), nothing written\n", type);
++			torch_level = 0;
++		} else if (sweet_spmi_read(ALARM_SID, ALARM_BASE + 0x05, &alarm_subtype) == 0) {
++			alarm_found = true;
++			printf("SWEET TORCH: PM8150L temperature alarm subtype %#x\n", alarm_subtype);
++		}
++	}
++	sweet_spmi_vibtorch_writes(vib_level >= 2, torch_level >= 2);
++	vt_boot_tests();
++	if (vib_level < 3 && torch_level < 3) {
++		thread_terminate(current_thread());
++		return;
++	}
++	printf("SWEET VIB/TORCH: serving%s%s\n", vib_level >= 3 ? " kern.sweet_vibrate" : "",
++	    torch_level >= 3 ? " kern.sweet_torch" : "");
++	for (;;) {
++		uint32_t want_ms, want_torch;
++		bool want_stop;
++
++		IOLockLock(vt_lock);
++		want_ms = vib_req_ms;
++		want_stop = vib_req_stop;
++		want_torch = torch_req;
++		vib_req_ms = 0;
++		vib_req_stop = false;
++		IOLockUnlock(vt_lock);
++
++		uint64_t now = vt_now_ms();
++		if (vt_leaving) {
++			break;
++		}
++		/* vibration */
++		if (vib_level >= 3) {
++			if (want_stop) {
++				vib_until = 0;
++			} else if (want_ms != 0) {
++				vib_until = now + want_ms;
++				if (!hap_playing && !hap_start()) {
++					(void)hap_stop();
++					vib_until = 0;
++				}
++			}
++			if (hap_playing && (now >= vib_until || hap_short())) {
++				if (now < vib_until) {
++					vt_give_up(&vt_hap, "short circuit while running");
++				}
++				(void)hap_stop();
++				vib_until = 0;
++			}
++			vib_now_ms_left = hap_playing && vib_until > now ? (uint32_t)(vib_until - now) : 0;
++		}
++		/* torch */
++		if (torch_level >= 3) {
++			if (want_torch != torch_cur) {
++				if (want_torch == 0) {
++					(void)fl_dark();
++				} else if (fl_light(want_torch)) {
++					if (torch_cur == 0) {
++						torch_since = now;
++					}
++					printf("SWEET TORCH: on, %u/1000 of %u mA\n", want_torch, FL_MAX_MA);
++				} else {
++					(void)fl_dark();
++					want_torch = 0;
++				}
++				torch_cur = fl_lit ? want_torch : 0;
++			}
++			if (fl_lit && now - last_check >= 100) {
++				const char *why = fl_trouble();
++				last_check = now;
++				if (why != NULL || now - torch_since >= torch_max_s * 1000ull) {
++					printf("SWEET TORCH: off: %s\n", why ? why : "time limit");
++					if (why) {
++						vt_give_up(&vt_fl, why);
++					}
++					(void)fl_dark();
++					torch_cur = 0;
++					IOLockLock(vt_lock);
++					if (torch_req == want_torch) {
++						torch_req = 0;  /* stays off until asked anew */
++					}
++					IOLockUnlock(vt_lock);
++				}
++			}
++			torch_now = torch_cur;
++		}
++		vt_sleep_ms(hap_playing ? 5 : fl_lit ? 100 : 0);
++	}
++	thread_terminate(current_thread());
++}
++
++void
++sweet_vibtorch_init(void)
++{
++	thread_t thread;
++	uint32_t v;
++
++	if (!sweet_board_raphael()) {
++		return;
++	}
++	v = 0;
++	if (PE_parse_boot_argn("sweetvib", &v, sizeof(v)) && v > 0) {
++		vib_level = v > 3 ? 3 : (int)v;
++	}
++	v = 0;
++	if (PE_parse_boot_argn("sweettorch", &v, sizeof(v)) && v > 0) {
++		torch_level = v > 3 ? 3 : (int)v;
++	}
++	if (PE_parse_boot_argn("sweettorch_max_s", &v, sizeof(v)) && v >= 1) {
++		torch_max_s = v > 120 ? 120 : v;
++	}
++	if (!vib_level && !torch_level) {
++		return;
++	}
++	vt_lock = IOLockAlloc();
++	if (vt_lock == NULL || kernel_thread_start(vt_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET VIB/TORCH: could not start\n");
++		vib_level = torch_level = 0;
++		return;
++	}
++	thread_deallocate(thread);
++	printf("SWEET VIB/TORCH: sweetvib=%d sweettorch=%d\n", vib_level, torch_level);
++}
++
++/* Before a reboot (thread context, not a panic): both off. */
++void
++sweet_vibtorch_quiesce(void)
++{
++	if (!sweet_board_raphael() || vt_lock == NULL) {
++		return;
++	}
++	vt_leaving = true;
++	vt_kick();
++	delay_for_interval(20, NSEC_PER_MSEC);    /* let the worker leave its loop */
++	if (hap_playing || hap_on) {
++		vt_hap.broken = false;
++		printf("SWEET VIB: before reboot: %s\n", hap_stop() ? "stopped" : "COULD NOT BE STOPPED");
++	}
++	if (fl_lit) {
++		vt_fl.broken = false;
++		printf("SWEET TORCH: before reboot: %s\n", fl_dark() ? "off" : "COULD NOT BE SWITCHED OFF");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -62,10 +62,14 @@ jobs:
           mkdir -p inputs/raphael
           curl -sL -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ inputs.kernel_run_id }}/artifacts" -o /tmp/arts.json
-          ID=$(python3 -c "import json;print([a['id'] for a in json.load(open('/tmp/arts.json'))['artifacts'] if a['name']=='raphael-kernel'][0])")
+          # raphael-kernel (old SM8150 kernel runs) or xnu-kernel (xnu.yml: kernel.development.sweet)
+          ID=$(python3 -c "import json;a=json.load(open('/tmp/arts.json'))['artifacts'];print([x['id'] for x in a if x['name'] in ('raphael-kernel','xnu-kernel')][0])")
           curl -sL -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID/zip" -o /tmp/k.zip
           python3 -c "import zipfile;zipfile.ZipFile('/tmp/k.zip').extractall('inputs/raphael')"
+          if [ ! -e inputs/raphael/kernel.macho ] && [ -e inputs/raphael/kernel.development.sweet ]; then
+            cp inputs/raphael/kernel.development.sweet inputs/raphael/kernel.macho
+          fi
           ls -l inputs/raphael
 
       - name: Checkout UniXNU driver (pinned)

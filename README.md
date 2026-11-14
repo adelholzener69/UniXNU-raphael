@@ -7,7 +7,7 @@ combines two projects:
   [original UniXNU-raphael](https://github.com/JohnLeeeeeee678/UniXNU-raphael)): Project Aloha UEFI for SM8150 with the
   UniXNU menu and DarwinBoot, packed as an Android boot image (`firmware-only.yml`, `patches/`, `board.toml`, `scripts/`).
 - **[Bergamota](https://github.com/ry-diffusion/Bergamota) iOS 18 route**: the ios-sweet "Heartwood" kernel
-  (xnu-11215.81.4) with upstream's patch series, ported to raphael (patches 0260-0262), and the tools around it
+  (xnu-11215.81.4) with upstream's patch series, ported to raphael (patches 0260-0263), and the tools around it
   (`xnu/`, `tools/`, `xnu.yml`). Details: **[docs/IOS18.md](docs/IOS18.md)**.
 
 The earlier iOS 16.7.16 route (UniXNU / xnu-8796 SWEET kernel, home screen + touch, CPU rendering) is archived on
@@ -25,6 +25,7 @@ partition to the home screen with GPU compositing.**
 | Touch, buttons | GT9886 (Normandy) touch, PON / volume keys (patch 0260) |
 | GPU | Adreno 640 kernel driver (0261: GMU, HFI v2, GX, zap, CP, governor 257-585 MHz). Chlorophyll (Bergamota's Metal driver over Mesa freedreno, upstream's prebuilt dylibs) as the system compositor and for the iOS 18 wallpaper: home-screen swipes 32 fps (CPU compositing: 10 fps) |
 | Clock, battery | Wall clock from the PM8150 RTC (set once, kept across reboots); live charge level from the PM8150B fuel gauge (0262) |
+| Vibration, torch | PM8150B vibration motor and PM8150L flash LED, ported from [HakiOS](https://github.com/adelholzener69/hakios-xnu-kernel-raphael) (0263): off by default, `sweetvib=3 sweettorch=3` serve `kern.sweet_vibrate` / `kern.sweet_torch`. Not yet run on the phone; iOS's own haptics and Control Center flashlight are not hooked up |
 | Debug | USB CDC-ECM link to WSL: SSH and the kernel log over UDP (`tools/raphael/usblink.sh`) |
 | Not working | Wi-Fi, Bluetooth, cellular, audio, camera, sensors; Settings > Date & Time hangs |
 
@@ -34,7 +35,7 @@ partition to the home screen with GPU compositing.**
 | --- | --- |
 | `.github/workflows/xnu.yml` | Kernel build (macOS runner, ~20 min): `xnu/patches-11215` on xnu-11215.81.4, artifact `xnu-kernel` |
 | `.github/workflows/firmware-only.yml` | UEFI + UniXNU + DarwinBoot firmware and a base boot image (`variant=full`) |
-| `xnu/patches-11215/` | Heartwood patch series: upstream Bergamota 0001-0259, raphael 0260 (board, keys, touch), 0261 (A640 GPU), 0262 (RTC, battery) |
+| `xnu/patches-11215/` | Heartwood patch series: upstream Bergamota 0001-0259, raphael 0260 (board, keys, touch), 0261 (A640 GPU), 0262 (RTC, battery), 0263 (vibration, torch) |
 | `xnu/gpu-abi/` | Kernel/userland GPU interface header (SweetAdreno user client) |
 | `tools/raphael/` | `mkboot-raphael.sh` (pack kernel + ADT + boot-args into the base image), `usblink.sh`, touch host test, `bgmtl-env` helper and Chlorophyll staging scripts |
 | `tools/mkadt.py`, `tools/adt-gpufw.py` | Apple Device Tree for raphael (`--board raphael`, from Apple's D22AP tree) and GPU firmware into it |

@@ -2,7 +2,7 @@
 
 Port of [Bergamota](https://github.com/ry-diffusion/Bergamota) (iOS 18.7.8 on the Poco F1 / SDM845) to `raphael`
 (Qualcomm SM8150, 6 GB, Adreno 640). The kernel patch series in `xnu/patches-11215` is upstream's, plus the raphael
-patches 0260-0262; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
+patches 0260-0263; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
 series stay untouched (they check for `xiaomi,beryllium`).
 
 ## What is raphael-specific
@@ -143,3 +143,30 @@ Checked on the phone 2026-11-06 (kernel run 42190048551, image T12):
 - Register dumps: `sysctl -w kern.sweet_spmi_addr=$(( (SID << 16) | 0xADDR ))`, then `sysctl kern.sweet_spmi_dump`.
 - Time zone without Settings (its Date & Time page hangs on this phone): as root
   `ln -sf /var/db/timezone/zoneinfo/Asia/Kuala_Lumpur /var/db/timezone/localtime`, then restart SpringBoard.
+
+## Vibration and torch (patch 0263)
+
+Ported from HakiOS's raphael drivers (`drivers/haptic/hakios.raphael_haptic.c`, the raphael path of
+`drivers/camera/hakios.torch.c`, [adelholzener69/hakios-xnu-kernel-raphael](https://github.com/adelholzener69/hakios-xnu-kernel-raphael)),
+where they work on this phone, onto `sweet_spmi.c`: `bsd/dev/sweet_vibtorch.c`. Off unless a boot-arg asks:
+
+| Boot-arg | Does |
+| --- | --- |
+| `sweetvib=1`, `sweettorch=1` | log the PM8150B haptics block (SID 3 0xc000) / PM8150L flash module (SID 5 0xd300), reads only |
+| `sweetvib=2` (`sweetvib_ms=150`) | one buzz at boot, then off |
+| `sweettorch=2` (`sweettorch_s=2`) | the light at 100 mA for N s at boot, then off |
+| `sweetvib=3`, `sweettorch=3` | serve the sysctls below until reboot (`sweettorch_max_s=30`, at most 120) |
+
+Over SSH, as root, with `=3`:
+- `sysctl -w kern.sweet_vibrate=200`: buzz 200 ms (1..1000; 0 stops). Drive 2552 mV, below the device tree's 3000.
+- `sysctl -w kern.sweet_torch=500`: torch at 500/1000 of 100 mA (12.5 mA steps); `0` off. Goes off by itself after
+  `sweettorch_max_s`, and stays off until written again.
+
+Only ten single-byte registers become writable, and only with `=2` or `=3`. Every write is read back. A short
+circuit, a flash fault, supply droop, the PM8150L temperature alarm or a write that does not read back switches
+the part off for the rest of the boot (`SWEET VIB:` / `SWEET TORCH:` in the log says why). Both are switched off
+before a reboot.
+
+Status: compiled (syntax-only) and simulated against a fake PMIC; **not yet run on the phone**. Start with `=1`
+and check that the log shows type 0x18 subtype 0x04 for the flash module (HakiOS saw that on the phone) before
+trying `=2`. iOS's own haptics (CoreHaptics) and Control Center's flashlight do not reach these sysctls yet.
