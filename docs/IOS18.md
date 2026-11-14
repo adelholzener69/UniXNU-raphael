@@ -2,7 +2,7 @@
 
 Port of [Bergamota](https://github.com/ry-diffusion/Bergamota) (iOS 18.7.8 on the Poco F1 / SDM845) to `raphael`
 (Qualcomm SM8150, 6 GB, Adreno 640). The kernel patch series in `xnu/patches-11215` is upstream's, plus the raphael
-patches 0260-0263; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
+patches 0260-0264; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
 series stay untouched (they check for `xiaomi,beryllium`).
 
 ## What is raphael-specific
@@ -119,8 +119,13 @@ Boot setup that works (image T11: kernel run 42185225498 / fc830fa, plain `rapha
 backboardd starts; `bgmtl-env.dylib` waits for it, and backboardd composites on the GPU from boot.
 - `sweetfb_hz=30` (used before) copies a frame to the panel only every second vsync: about 30 fps at most.
 - `sweetgpufreq=g`: the DCVS governor (257-585 MHz); the default is the lowest level, fixed.
-- GPU firmware in the ADT (`raphael-3x-gpu.adt`) does not work yet: the driver then starts very early and the GMU
-  took a translation fault (CB0 FSR 0x402, write at GMU VA 0x57308) on the one boot tried.
+- GPU firmware in the ADT (`raphael-3x-gpu.adt`): on the one boot tried the GMU took a translation fault (CB0 FSR
+  0x402, write at GMU VA 0x57308). The same fault came with the firmware read from `/usr/local/share/firmware`
+  (2026-11-14, local build); its cause was `dma_alloc()` leaving the last, partial 16 KiB page of the GMU table
+  block cached, fixed by patch 0264. With 0264 the firmware-from-file boot reaches stage 8 and Chlorophyll runs as
+  the compositor; the ADT route has not been tried again.
+- Without a stock `vendor` partition on the phone, the firmware comes from Xiaomi's recovery ROM
+  (`vendor.new.dat.br` + `vendor.transfer.list`, `/firmware/a640_gmu.bin`, `a630_sqe.fw`, `a640_zap.*`).
 
 Home-screen swipes, frames reaching the panel (`tools/raphael/chlorophyll/fps.sh`, kern.sweet_fb counters), 60 Hz:
 CPU compositing 10/s with backboardd at 524 % CPU; GPU compositing 32/s with backboardd at 40 %, GPU 427 MHz 64 % busy.

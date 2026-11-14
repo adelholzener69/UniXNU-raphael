@@ -1,0 +1,35 @@
+raphael (A640): dma_alloc() in the GPU driver handles sizes that are not whole pages
+
+- dma_alloc() (bsd/dev/sweet_a630.c) checked contiguity and set the write-combined cache attribute for
+  size / PAGE_SIZE pages. The kernel's page is 16 KiB, so a size that is not a multiple of it left its last page
+  cached. The A640's GMU table block is GMEM_SIZE_A640 = 0x12000 (4.5 pages): GMEM_L2B (0x10000) and GMEM_L3C
+  (0x11000), the tables of the GMU's icache/dcache region (GMU VA 0x4000-0x7ffff), are in the fifth page.
+- Their entries stayed in the CPU cache, the MMU-500 walked stale memory, and the GMU's first access to that
+  region took a level 2 translation fault: "GMU did not boot", CB0 FSR 0x402 FSYNR0 0x20032 FAR 0x57308, the
+  fault docs/IOS18.md records for the firmware-in-ADT boot. Whether it hit depended on timing.
+- Fix: round the size up to whole pages first. The a630 sizes (Poco F1) are unchanged where they already were
+  multiples of 16 KiB; others now get their tail page treated like the rest.
+
+Checked on the phone (2026-11-14, local build, sweetgpu=8 sweetgpuwait=1800 sweetgpufreq=g, firmware from
+/usr/local/share/firmware): without the fix the GMU did not boot (the fault above); with it CM3_FW_INIT_RESULT
+0xbabeface, HFI v2 acknowledged, GX on at 257 MHz, zap authenticated, CP NOP and fill tests passed, SweetAdreno630
+published. One boot each.
+
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 5d3372a..540b6b0 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -474,6 +474,13 @@ dma_alloc(vm_size_t size, vm_offset_t *va, uint64_t *pa)
+ {
+ 	vm_offset_t kva;
+ 
++	/*
++	 * Whole pages: the loops below count size / PAGE_SIZE pages, so the tail of a size that is not a multiple of
++	 * the 16 KiB page (the A640's GMEM_SIZE_A640 0x12000: GMEM_L2B and GMEM_L3C are in its fifth page) stayed
++	 * cached, the SMMU walked stale table entries and the GMU's first access to its icache/dcache region took a
++	 * level 2 translation fault (CB0 FSR 0x402, FAR 0x57308 on raphael).
++	 */
++	size = round_page(size);
+ 	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET GPU: no contiguous DMA memory (%lu bytes)\n", (unsigned long)size);
