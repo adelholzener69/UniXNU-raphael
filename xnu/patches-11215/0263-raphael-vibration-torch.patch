@@ -21,15 +21,20 @@ raphael (Redmi K20 Pro, SM8150): the vibration motor and the flashlight, ported 
   (0..1000 permille of 100 mA). sweet_reboot_restart() switches both off first; on a panic,
   sweet_reboot_note_panic() calls sweet_vibtorch_panic(), which switches both off with SPMI in atomic mode (the
   write channels are already mapped). Without it, a panic during the boot buzz left the motor running.
+- kern.sweet_vibtorch_state (read-only string): both parts' level, type/subtype, latch and its reason, and why the
+  last probe read failed (sweet_spmi_read_why(), new in sweet_spmi.c). The probe is tried 10 times at start-up and
+  again when a buzz is asked for: on two iOS boots the first read of the haptics block failed, and the first
+  version then switched vibration off for the boot (kern.sweet_vibrate gave ENODEV).
 - Not here: iOS's own haptics and Control Center's flashlight do not reach these sysctls (HakiOS uses userland
   hooks for that).
 
 Checked: syntax-only compile of the changed files against this series' tree (clang, -Wall -Wextra, no warnings);
 the driver run in a user-space simulation against a fake PMIC enforcing this patch's whitelist (boot tests,
-sysctls, time limit, short circuit, temperature alarm, read-back mismatch, whitelist). On the phone (fastboot
-boot, no iOS root, so the boot ends in an initproc panic): the torch test lit the flashlight. Without the CFG1
-ERM write the motor did not buzz; with it, it buzzed, but the initproc panic came within the 500 ms test and
-left it running (hence the panic stop). The panic stop has run only in the simulation so far.
+sysctls, time limit, short circuit, temperature alarm, read-back mismatch, whitelist). On the phone (2026-11-14, local build): without an iOS root (fastboot boot, the boot ends in an initproc panic)
+the boot tests lit the flashlight and, with the CFG1 ERM write, buzzed; a panic during the buzz and during the
+torch switched each off. With the iOS 18.7.8 root flashed (sweetvib=3 sweettorch=3, over SSH): kern.sweet_torch
+500 and 0 light and darken the flashlight, kern.sweet_vibrate 300 and 600 buzz, kern.sweet_vibtorch_state reports
+the haptics block as type 0x15 subtype 0x4 and the flash module as type 0x18 subtype 0x4, nothing latched.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 index ea5a65a..2b3559b 100644
@@ -76,10 +81,30 @@ index 8228f52..82270b4 100644
  	 * Before anything else, make sure the UFS write cache holds nothing the file system already
  	 * completed: the reset below can power-cycle the device. Does not wait for dirty file pages
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index 2f0b945..cac801d 100644
+index 2f0b945..9c7aa6c 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -167,7 +167,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+@@ -139,6 +139,19 @@ sweet_spmi_init_locked(void)
+ 	return 0;
+ }
+ 
++/*
++ * Why the last sweet_spmi_read() failed (0263, for kern.sweet_vibtorch_state): 0 it did not, 1 refused (not ready or
++ * not on the read list), 2 no arbiter channel for the peripheral, 3 its channel was disabled after a timeout,
++ * 4 the arbiter reported an error (status in bits 8..15), 5 timeout.
++ */
++static unsigned sp_read_why;
++
++unsigned
++sweet_spmi_read_why(void)
++{
++	return sp_read_why;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+@@ -167,17 +180,21 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
  		 */
  		allowed = (sid == 0 && (peripheral == 0x60 || peripheral == 0x61)) ||
  		    (sid == 2 && (peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 || peripheral == 0x13 ||
@@ -90,7 +115,39 @@ index 2f0b945..cac801d 100644
  	} else {
  		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
  		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
-@@ -226,6 +228,14 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	}
+ 	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
++		sp_read_why = 1;
+ 		return -1;
+ 	}
+ 	bool got = sp_take();
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		sp_read_why = apid == SP_NO_APID ? 2 : 3;
+ 		sp_put(got);
+ 		return -1;
+ 	}
+@@ -190,16 +207,19 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				sp_read_why = 4 | (status & 0xffu) << 8;
+ 				sp_put(got);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			sp_read_why = 0;
+ 			sp_put(got);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
++	sp_read_why = 5;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+ 	sp_put(got);
+@@ -226,6 +246,14 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
   * termination, OTG) is writable.
   */
  static bool sp_charger_writes;
@@ -105,7 +162,7 @@ index 2f0b945..cac801d 100644
  
  void
  sweet_spmi_charger_writes(void)
-@@ -237,8 +247,28 @@ static bool
+@@ -237,8 +265,28 @@ static bool
  sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
  {
  	if (sweet_board_raphael()) {
@@ -137,7 +194,7 @@ index 2f0b945..cac801d 100644
  	if (!sweet_board_beryllium() || len < 1 || len > 2) {
  		return false;
 diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
-index 977edbe..b77d2b3 100644
+index 977edbe..ef31f85 100644
 --- a/bsd/dev/sweet_spmi.h
 +++ b/bsd/dev/sweet_spmi.h
 @@ -1,6 +1,7 @@
@@ -148,7 +205,16 @@ index 977edbe..b77d2b3 100644
  #include <stdint.h>
  #ifdef __cplusplus
  extern "C" {
-@@ -15,6 +16,8 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -8,6 +9,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Why the last sweet_spmi_read() failed: 0 it did not, else a code (see sweet_spmi.c). */
++unsigned sweet_spmi_read_why(void);
+ /*
+  * Poco F1 only: 1..2 byte EXT_WRITEL restricted to the PMI8998 WLED sink
+  * brightness/sync registers (see sweet_spmi.c). Thread context only.
+@@ -15,6 +18,8 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
  int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
  /* Poco F1: unlock the seven PMI8998 charger registers of sweet_spmi_write (sweetcharger=2 only). */
  void sweet_spmi_charger_writes(void);
@@ -179,10 +245,10 @@ index 27caa07..f48aa5c 100644
  	sweet_touch_init();
 diff --git a/bsd/dev/sweet_vibtorch.c b/bsd/dev/sweet_vibtorch.c
 new file mode 100644
-index 0000000..b631951
+index 0000000..ecc66ce
 --- /dev/null
 +++ b/bsd/dev/sweet_vibtorch.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,660 @@
 +/*
 + * raphael (Redmi K20 Pro / Mi 9T Pro, SM8150): the vibration motor and the flashlight (patch 0263).
 + *
@@ -249,6 +315,10 @@ index 0000000..b631951
 +	unsigned sid, base;
 +	bool broken;    /* latched: no more writes this boot */
 +	bool forcing;   /* the off writes pass the latch */
++	bool found;     /* the block answered: type, subtype */
++	uint8_t type, subtype;
++	const char *why;        /* what latched it */
++	unsigned read_why;      /* sweet_spmi_read_why() of the read that failed in the last probe */
 +};
 +
 +static struct vt_part vt_hap = { .name = "SWEET VIB", .sid = 3, .base = 0xc000 };
@@ -259,6 +329,7 @@ index 0000000..b631951
 +{
 +	if (!p->broken) {
 +		p->broken = true;
++		p->why = why;
 +		printf("%s: %s: no more writes this boot\n", p->name, why);
 +	}
 +}
@@ -302,15 +373,31 @@ index 0000000..b631951
 +	return (now & mask) == (value & mask) || vt_put(p, reg, (uint8_t)((now & ~mask) | (value & mask)), true);
 +}
 +
++/*
++ * The block's type and subtype, `tries' times 50 ms apart: on the phone the first read of the haptics block failed
++ * once at boot (and that used to switch vibration off for the whole boot).
++ */
 +static bool
-+vt_probe(struct vt_part *p)
++vt_probe(struct vt_part *p, unsigned tries)
 +{
 +	uint8_t type = 0, subtype = 0;
 +
-+	if (!vt_get(p, 0x04, &type) || !vt_get(p, 0x05, &subtype)) {
-+		printf("%s: SID %u %#x cannot be read\n", p->name, p->sid, p->base);
-+		return false;
++	for (unsigned i = 0;; i++) {
++		if (vt_get(p, 0x04, &type) && vt_get(p, 0x05, &subtype)) {
++			break;
++		}
++		p->read_why = sweet_spmi_read_why();
++		if (i + 1 >= tries) {
++			printf("%s: SID %u %#x cannot be read (SPMI %#x, %u tries)\n", p->name, p->sid, p->base,
++			    p->read_why, tries);
++			return false;
++		}
++		delay_for_interval(50, NSEC_PER_MSEC);
 +	}
++	p->found = true;
++	p->type = type;
++	p->subtype = subtype;
++	p->read_why = 0;
 +	printf("%s: SID %u %#x type %#x subtype %#x\n", p->name, p->sid, p->base, type, subtype);
 +	return true;
 +}
@@ -340,7 +427,7 @@ index 0000000..b631951
 +static bool
 +hap_start(void)
 +{
-+	if (vt_hap.broken) {
++	if (vt_hap.broken || (!vt_hap.found && !vt_probe(&vt_hap, 1))) {
 +		return false;
 +	}
 +	if (hap_short()) {
@@ -547,6 +634,28 @@ index 0000000..b631951
 +	return 0;
 +}
 +
++/* kern.sweet_vibtorch_state: one line on both parts, for a look from a shell (the boot lines scroll out of the log). */
++static int
++vt_state_sysctl SYSCTL_HANDLER_ARGS
++{
++	(void)oidp;
++	(void)arg1;
++	(void)arg2;
++	char line[320];
++
++	snprintf(line, sizeof(line),
++	    "vib level %d found %d type %#x subtype %#x broken %d (%s) spmi %#x on %d playing %d left %u; "
++	    "torch level %d found %d type %#x subtype %#x broken %d (%s) spmi %#x lit %d now %u",
++	    vib_level, vt_hap.found, vt_hap.type, vt_hap.subtype, vt_hap.broken, vt_hap.why ? vt_hap.why : "-",
++	    vt_hap.read_why, hap_on, hap_playing, vib_now_ms_left,
++	    torch_level, vt_fl.found, vt_fl.type, vt_fl.subtype, vt_fl.broken, vt_fl.why ? vt_fl.why : "-",
++	    vt_fl.read_why, fl_lit, torch_now);
++	return sysctl_io_string(req, line, 0, 0, NULL);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_vibtorch_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    vt_state_sysctl, "A", "raphael: state of the vibration motor and flashlight driver (0263)");
++
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
 +    vt_vibrate_sysctl, "I", "raphael: buzz the vibration motor for N ms (sweetvib=3; 0 stops)");
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
@@ -620,13 +729,14 @@ index 0000000..b631951
 +		thread_terminate(current_thread());
 +		return;
 +	}
-+	if (vib_level && !vt_probe(&vt_hap)) {
-+		vib_level = 0;
++	if (vib_level) {
++		/* not found now: kept at its level, hap_start() looks again when a buzz is asked for */
++		(void)vt_probe(&vt_hap, 10);
 +	}
 +	if (torch_level) {
-+		uint8_t type = 0;
-+		if (!vt_probe(&vt_fl) || !vt_get(&vt_fl, 0x04, &type) || type != 0x18) {
-+			printf("SWEET TORCH: not a flash LED module (type %#x), nothing written\n", type);
++		if (!vt_probe(&vt_fl, 10) || vt_fl.type != 0x18) {
++			printf("SWEET TORCH: not a flash LED module (type %#x), nothing written\n", vt_fl.type);
++			vt_fl.why = "not a flash LED module";
 +			torch_level = 0;
 +		} else if (sweet_spmi_read(ALARM_SID, ALARM_BASE + 0x05, &alarm_subtype) == 0) {
 +			alarm_found = true;

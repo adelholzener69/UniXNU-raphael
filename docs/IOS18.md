@@ -172,8 +172,17 @@ before a reboot and on a panic (`sweet_reboot_note_panic`).
 The driver, like USB, keys and touch, is started by `sweet_ufs.c` once it has found the root partition
 (`rd=ufsroot0`); with any other `rd=` none of them run.
 
-Status (2026-11-14, local build, `fastboot boot` without an iOS root, so every boot ended in the `initproc exited`
-panic): `sweettorch=2` lit the flashlight; `sweetvib=2` buzzed (with the ERM write); a panic during the buzz and
-during the torch switched each off at once. Not yet run: the end of a boot test without a panic, and `=3` (the
-sysctls need an iOS root and a shell). iOS's own haptics (CoreHaptics) and Control Center's flashlight do not reach
-these sysctls yet.
+`kern.sweet_vibtorch_state` (read-only) gives one line on both parts: level, type and subtype, whether a part is
+latched off and why, and why the last probe read failed. iOS has no `sysctl` command; `tools/raphael/vibtorch/vt.c`
+is a small one for these three (`vt state`, `vt vib 300`, `vt torch 500`):
+
+```sh
+xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=15.0 -O2 -o vt tools/raphael/vibtorch/vt.c && codesign -f -s - vt
+```
+
+Status (2026-11-14, local build): both work on the phone. Without an iOS root the boot tests (`=2`) light the
+flashlight and buzz, and a panic during either switches it off. With the iOS 18.7.8 root (`=3`, over SSH)
+`kern.sweet_torch` and `kern.sweet_vibrate` light and buzz; the state line shows the haptics block as type 0x15
+subtype 0x4 and the flash module as type 0x18 subtype 0x4. On two iOS boots the first read of the haptics block
+failed (cause unknown); the probe is now retried, also when a buzz is asked for. iOS's own haptics (CoreHaptics)
+and Control Center's flashlight do not reach these sysctls yet.
