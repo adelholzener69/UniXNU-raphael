@@ -2,7 +2,7 @@
 
 Port of [Bergamota](https://github.com/ry-diffusion/Bergamota) (iOS 18.7.8 on the Poco F1 / SDM845) to `raphael`
 (Qualcomm SM8150, 6 GB, Adreno 640). The kernel patch series in `xnu/patches-11215` is upstream's, plus the raphael
-patches 0260-0264; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
+patches 0260-0265; it was developed in a private copy and imported here (see NOTICE.md). The Poco F1 parts of the
 series stay untouched (they check for `xiaomi,beryllium`).
 
 ## What is raphael-specific
@@ -135,6 +135,44 @@ no fixups, arm64e header, ad hoc signature). Besides the backboardd gate above, 
 `/private/var/tmp/bgmtl.defer` into `BGMTL_DEFER_SCHEDULED=1` and the first line of
 `/private/var/tmp/bgmtl.fddebug` into `FD_MESA_DEBUG`, and logs each start to `/private/var/tmp/bgmtl-env.log`.
 It was used for the A/B tests (`nobin` and `sysmem,nolrz,noubwc` did not change the flicker).
+
+## Panel brightness (patch 0265)
+
+raphael's panel is an AMOLED (Samsung EA8076) without a backlight, so the Poco F1's WLED path does nothing on it.
+`bsd/dev/sweet_dsibl.c`, ported from HakiOS (`drivers/gpu/hakios.adreno.c`), sends DCS "set display brightness"
+(0x51, level 2..2047) through the DSI0 controller's DMA command engine. Off unless a boot-arg asks:
+
+| Boot-arg | Does |
+| --- | --- |
+| `sweetbl=1` | log the DSI0 registers, reads only |
+| `sweetbl=2` | serve `kern.sweet_brightness` (0..1000, writable by any user; a read gives the last level sent) |
+
+`vt bl 300` (`tools/raphael/vibtorch/vt.c`) sets it from a shell on the phone. 0 is the dimmest level, never off.
+With the backlight service on (`sweetfb_blsvc=1`), a level iOS sets on it is passed on as well.
+
+Status (2026-11-14, local build): the sysctl works on the phone (200, 1000, 30 and 500 each changed the panel).
+iOS's own slider does not: with `sweetfb_blsvc=1` backboardd finds the service and then crashes about 10 s after each
+start (EXC_BAD_ACCESS at address 0 inside CoreBrightness, before any level is set), in a loop; Chlorophyll's watchdog
+then writes `bgmtl-bb.off`, so re-arm it afterwards (`push_backboardd.sh arm`). Leave `sweetfb_blsvc` off.
+
+### iOS's slider (backboardd hook)
+
+Instead of a backlight service, `tools/raphael/blhook/sweet_bl_hook.c` is linked into backboardd, as HakiOS does it
+(`userland/src/inject.c`): it replaces `-[BKDisplayBrightnessController setBrightnessLevel:reason:options:]` (calls
+the original, then writes the level to `kern.sweet_brightness`), makes `isBrightnessLevelControlAvailable` answer
+yes and `brightnessLevel` return the level last set. Log: `/private/var/tmp/sweet-bl-hook.log`.
+
+```sh
+xcrun -sdk iphoneos clang -arch arm64e -mios-version-min=18.0 -O2 -dynamiclib \
+    -install_name /usr/local/lib/sweet/bl-hook.dylib -o bl-hook.dylib tools/raphael/blhook/sweet_bl_hook.c -lobjc
+python3 -I tools/renegade/pacstrip.py --sign bl-hook.dylib
+python3 tools/raphael/blhook/stage_backboardd_bl.py tools/renegade BACKBOARDD_IN BACKBOARDD_OUT
+```
+
+On the phone: the library to `/usr/local/lib/sweet/bl-hook.dylib` first, then backboardd (temp name, then rename),
+then restart backboardd. backboardd's header has 64 bytes left for one more load command after Chlorophyll's two:
+the path cannot be longer than 39 characters. Status (2026-11-15): the three methods are hooked on iOS 18.7.8 and
+iOS's first level (0.5) reached the kernel; backboardd stays up on Chlorophyll.
 
 ## Clock and battery (patch 0262)
 

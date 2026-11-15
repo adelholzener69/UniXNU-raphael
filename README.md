@@ -7,7 +7,7 @@ combines two projects:
   [original UniXNU-raphael](https://github.com/JohnLeeeeeee678/UniXNU-raphael)): Project Aloha UEFI for SM8150 with the
   UniXNU menu and DarwinBoot, packed as an Android boot image (`firmware-only.yml`, `patches/`, `board.toml`, `scripts/`).
 - **[Bergamota](https://github.com/ry-diffusion/Bergamota) iOS 18 route**: the ios-sweet "Heartwood" kernel
-  (xnu-11215.81.4) with upstream's patch series, ported to raphael (patches 0260-0264), and the tools around it
+  (xnu-11215.81.4) with upstream's patch series, ported to raphael (patches 0260-0265), and the tools around it
   (`xnu/`, `tools/`, `xnu.yml`). Details: **[docs/IOS18.md](docs/IOS18.md)**.
 
 The earlier iOS 16.7.16 route (UniXNU / xnu-8796 SWEET kernel, home screen + touch, CPU rendering) is archived on
@@ -35,7 +35,7 @@ partition to the home screen with GPU compositing.**
 | --- | --- |
 | `.github/workflows/xnu.yml` | Kernel build (macOS runner, ~20 min): `xnu/patches-11215` on xnu-11215.81.4, artifact `xnu-kernel` |
 | `.github/workflows/firmware-only.yml` | UEFI + UniXNU + DarwinBoot firmware and a base boot image (`variant=full`) |
-| `xnu/patches-11215/` | Heartwood patch series: upstream Bergamota 0001-0259, raphael 0260 (board, keys, touch), 0261 (A640 GPU), 0262 (RTC, battery), 0263 (vibration, torch), 0264 (GPU DMA page fix) |
+| `xnu/patches-11215/` | Heartwood patch series: upstream Bergamota 0001-0259, raphael 0260 (board, keys, touch), 0261 (A640 GPU), 0262 (RTC, battery), 0263 (vibration, torch), 0264 (GPU DMA page fix), 0265 (panel brightness) |
 | `xnu/gpu-abi/` | Kernel/userland GPU interface header (SweetAdreno user client) |
 | `tools/raphael/` | `mkboot-raphael.sh` (pack kernel + ADT + boot-args into the base image), `usblink.sh`, touch host test, `bgmtl-env` helper and Chlorophyll staging scripts |
 | `tools/mkadt.py`, `tools/adt-gpufw.py` | Apple Device Tree for raphael (`--board raphael`, from Apple's D22AP tree) and GPU firmware into it |
